@@ -8,7 +8,13 @@ const rateLimit = require('express-rate-limit');
 
 // Import routes
 const mercadoPagoRoutes = require('./routes/mercadoPago');
+const authRoutes = require('./routes/auth');
 const clinicRoutes = require('./routes/clinic');
+const patientRoutes = require('./routes/patients');
+const appointmentRoutes = require('./routes/appointments');
+const collaboratorRoutes = require('./routes/collaborators');
+const serviceRoutes = require('./routes/services');
+const transactionRoutes = require('./routes/transactions');
 
 // Initialize Express app
 const app = express();
@@ -57,7 +63,13 @@ app.get('/health', (req, res) => {
 
 // API routes
 app.use('/api/mercadopago', mercadoPagoRoutes);
+app.use('/api/auth', authRoutes);
 app.use('/api/clinic', clinicRoutes);
+app.use('/api/patients', patientRoutes);
+app.use('/api/appointments', appointmentRoutes);
+app.use('/api/collaborators', collaboratorRoutes);
+app.use('/api/services', serviceRoutes);
+app.use('/api/transactions', transactionRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
