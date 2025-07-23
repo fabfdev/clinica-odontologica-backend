@@ -61,6 +61,23 @@ class MercadoPagoController {
       const response = await preApproval.create({ body: preapprovalData });
 
       console.log('✅ Assinatura criada:', response.id);
+      
+      // Salvar o mpSubscriptionId imediatamente na clínica
+      try {
+        const db = admin.firestore();
+        const clinicRef = db.collection('clinics').doc(clinicId);
+        
+        await clinicRef.update({
+          mpSubscriptionId: response.id,
+          'subscription.status': 'pending', // Marcar como pendente até o pagamento ser processado
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        
+        console.log(`✅ mpSubscriptionId ${response.id} salvo para clínica ${clinicId}`);
+      } catch (updateError) {
+        console.error('❌ Erro ao salvar mpSubscriptionId:', updateError);
+        // Não falhar a criação da assinatura por causa disso
+      }
 
       res.json({ 
         subscriptionId: response.id,
@@ -110,7 +127,8 @@ class MercadoPagoController {
         premiumStatus: subscription.status === 'active' && !isExpired ? 'premium' : 'free',
         subscriptionStatus: isExpired ? 'expired' : (subscription.status || 'inactive'),
         currentPeriodEnd: expiresAt.toISOString(),
-        subscriptionId: clinicData.mpSubscriptionId || null,
+        mpSubscriptionId: clinicData.mpSubscriptionId || null,
+        subscriptionId: clinicData.mpSubscriptionId || null, // manter compatibilidade
         plan: subscription.plan || null
       };
 
@@ -245,7 +263,7 @@ class MercadoPagoController {
   // Verificar assinatura do webhook
   static verifyWebhookSignature(req) {
     if (!process.env.MP_WEBHOOK_SECRET) {
-      console.warn('⚠️ MP_WEBHOOK_SECRET não configurado - pulando verificação');
+      console.log('⚠️ MP_WEBHOOK_SECRET não configurado - pulando verificação');
       return true;
     }
 
@@ -253,7 +271,7 @@ class MercadoPagoController {
     const requestId = req.headers['x-request-id'];
     
     if (!signature || !requestId) {
-      console.error('❌ Headers de assinatura ausentes');
+      console.log('❌ Headers de assinatura ausentes');
       return false;
     }
 
@@ -264,6 +282,8 @@ class MercadoPagoController {
       .digest('hex');
 
     const receivedSignature = signature.split(',')[1]?.replace('v1=', '');
+
+    console.log({expectedSignature, receivedSignature})
     
     const isValid = expectedSignature === receivedSignature;
     
@@ -279,10 +299,20 @@ class MercadoPagoController {
     const payload = req.body;
     const topic = req.query.topic || req.query.type;
 
+    console.log('🔍 Webhook Debug Info:');
+    console.log('Query params:', req.query);
+    console.log('Headers:', req.headers);
+    console.log('Body:', payload);
+    console.log('Topic:', topic);
+
     try {
-      // Verificar assinatura do webhook
-      if (!MercadoPagoController.verifyWebhookSignature(req)) {
-        return res.status(401).json({ error: 'Invalid webhook signature' });
+      // TEMPORÁRIO: Pular verificação de assinatura em desenvolvimento
+      if (process.env.NODE_ENV === 'production') {
+        if (!MercadoPagoController.verifyWebhookSignature(req)) {
+          return res.status(401).json({ error: 'Invalid webhook signature' });
+        }
+      } else {
+        console.log('⚠️ Desenvolvimento: Pulando verificação de assinatura do webhook');
       }
 
       console.log(`📧 Webhook MP recebido: ${topic}`, payload);
@@ -293,6 +323,10 @@ class MercadoPagoController {
           break;
         
         case 'authorized_payment':
+          await MercadoPagoController.handlePaymentWebhook(payload);
+          break;
+          
+        case 'payment':
           await MercadoPagoController.handlePaymentWebhook(payload);
           break;
           
@@ -343,33 +377,203 @@ class MercadoPagoController {
 
   // Handler para webhooks de pagamento
   static async handlePaymentWebhook(payload) {
-    const paymentId = payload.data.id;
+    const paymentId = payload.resource || payload.data?.id;
     
     try {
       // Buscar detalhes do pagamento
       const paymentData = await payment.get({ id: paymentId });
       
       console.log(`💳 Pagamento processado: ${paymentId} - Status: ${paymentData.status}`);
+      console.log('Payment data:', JSON.stringify(paymentData, null, 2));
 
+      // Extrair informações do pagamento
+      const externalReference = paymentData.external_reference;
+      const preapprovalId = paymentData.preapproval_id;
+      
+      console.log(`External reference: ${externalReference}`);
+      console.log(`Preapproval ID: ${preapprovalId}`);
+      
       if (paymentData.status === 'approved') {
-        // Pagamento aprovado - atualizar período da assinatura
-        const clinicId = paymentData.external_reference?.split('-')[1];
-        
-        if (clinicId) {
-          // Estender período da assinatura
-          const nextPeriod = new Date();
-          nextPeriod.setMonth(nextPeriod.getMonth() + 1);
-          
-          console.log(`✅ Pagamento aprovado para clínica ${clinicId}`);
-          // Atualizar no banco
-        }
+        // Pagamento aprovado - atualizar assinatura
+        await MercadoPagoController.processApprovedPayment(paymentId, paymentData, externalReference, preapprovalId);
       } else if (paymentData.status === 'rejected') {
         console.log(`❌ Pagamento rejeitado: ${paymentId}`);
-        // Implementar lógica para pagamento rejeitado
+        await MercadoPagoController.processRejectedPayment(paymentId, paymentData, externalReference, preapprovalId);
+      } else {
+        console.log(`ℹ️ Pagamento em outro status: ${paymentData.status} - ID: ${paymentId}`);
       }
       
     } catch (error) {
       console.error('Error handling payment webhook:', error);
+    }
+  }
+  
+  // Processar pagamento aprovado
+  static async processApprovedPayment(paymentId, paymentData, externalReference, preapprovalId) {
+    try {
+      const db = admin.firestore();
+      
+      // Tentar extrair clinicId do external_reference ou buscar pela subscription ID
+      let clinicId = null;
+      
+      if (externalReference && externalReference.includes('clinic-')) {
+        clinicId = externalReference.split('-')[1];
+        console.log(`✅ Clinic ID extraído do external_reference: ${clinicId}`);
+      } else if (preapprovalId) {
+        // Buscar clínica pelo subscription ID
+        console.log(`🔍 Buscando clínica pelo preapproval ID: ${preapprovalId}`);
+        const clinicsQuery = await db.collection('clinics')
+          .where('mpSubscriptionId', '==', preapprovalId)
+          .get();
+          
+        if (!clinicsQuery.empty) {
+          clinicId = clinicsQuery.docs[0].id;
+          console.log(`✅ Clinic ID encontrado pela subscription: ${clinicId}`);
+        }
+      }
+      
+      if (!clinicId) {
+        console.error('❌ Não foi possível identificar a clínica do pagamento');
+        return;
+      }
+      
+      // Buscar dados da clínica
+      const clinicRef = db.collection('clinics').doc(clinicId);
+      const clinicDoc = await clinicRef.get();
+      
+      if (!clinicDoc.exists) {
+        console.error(`❌ Clínica ${clinicId} não encontrada`);
+        return;
+      }
+      
+      const clinicData = clinicDoc.data();
+      const currentSubscription = clinicData.subscription || {};
+      
+      // Determinar o tipo de plano baseado no valor
+      const amount = paymentData.transaction_amount;
+      const isMonthly = amount <= 50; // 49.90 para mensal
+      const planType = isMonthly ? 'monthly' : 'yearly';
+      
+      // Calcular nova data de expiração
+      let newExpirationDate;
+      const now = new Date();
+      const currentExpiration = currentSubscription.expiresAt?.toDate ? 
+        currentSubscription.expiresAt.toDate() : null;
+      
+      // Se já tem assinatura ativa e não expirou, estender a partir da data atual de expiração
+      const baseDate = currentExpiration && currentExpiration > now ? currentExpiration : now;
+      
+      if (isMonthly) {
+        newExpirationDate = new Date(baseDate);
+        newExpirationDate.setMonth(newExpirationDate.getMonth() + 1);
+      } else {
+        newExpirationDate = new Date(baseDate);
+        newExpirationDate.setFullYear(newExpirationDate.getFullYear() + 1);
+      }
+      
+      // Dados da transação para salvar
+      const transactionData = {
+        id: paymentId,
+        status: paymentData.status,
+        amount: amount,
+        currency: paymentData.currency_id,
+        paymentMethod: paymentData.payment_method_id,
+        processedAt: admin.firestore.FieldValue.serverTimestamp(),
+        externalReference: externalReference || null,
+        preapprovalId: preapprovalId || null,
+        payerEmail: paymentData.payer?.email || null
+      };
+      
+      // Atualizar dados da clínica
+      const updateData = {
+        subscription: {
+          status: 'active',
+          plan: planType,
+          expiresAt: admin.firestore.Timestamp.fromDate(newExpirationDate),
+          lastPaymentId: paymentId,
+          lastPaymentDate: admin.firestore.FieldValue.serverTimestamp(),
+          lastPaymentAmount: amount
+        },
+        lastTransactionData: transactionData,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      };
+      
+      // Só adicionar mpSubscriptionId se não for undefined
+      if (preapprovalId) {
+        updateData.mpSubscriptionId = preapprovalId;
+      }
+      
+      // Salvar transação separadamente na subcoleção
+      await clinicRef.collection('transactions').doc(paymentId).set(transactionData);
+      
+      // Atualizar documento da clínica
+      await clinicRef.update(updateData);
+      
+      console.log(`✅ Pagamento ${paymentId} processado com sucesso:`);
+      console.log(`   - Clínica: ${clinicId}`);
+      console.log(`   - Valor: R$ ${amount}`);
+      console.log(`   - Plano: ${planType}`);
+      console.log(`   - Nova expiração: ${newExpirationDate.toISOString()}`);
+      
+    } catch (error) {
+      console.error(`❌ Erro ao processar pagamento aprovado ${paymentId}:`, error);
+    }
+  }
+  
+  // Processar pagamento rejeitado
+  static async processRejectedPayment(paymentId, paymentData, externalReference, preapprovalId) {
+    try {
+      const db = admin.firestore();
+      
+      // Buscar clínica
+      let clinicId = null;
+      
+      if (externalReference && externalReference.includes('clinic-')) {
+        clinicId = externalReference.split('-')[1];
+      } else if (preapprovalId) {
+        const clinicsQuery = await db.collection('clinics')
+          .where('mpSubscriptionId', '==', preapprovalId)
+          .get();
+          
+        if (!clinicsQuery.empty) {
+          clinicId = clinicsQuery.docs[0].id;
+        }
+      }
+      
+      if (!clinicId) {
+        console.error('❌ Não foi possível identificar a clínica do pagamento rejeitado');
+        return;
+      }
+      
+      const clinicRef = db.collection('clinics').doc(clinicId);
+      
+      // Salvar transação rejeitada
+      const transactionData = {
+        id: paymentId,
+        status: paymentData.status,
+        amount: paymentData.transaction_amount,
+        currency: paymentData.currency_id,
+        paymentMethod: paymentData.payment_method_id,
+        processedAt: admin.firestore.FieldValue.serverTimestamp(),
+        externalReference: externalReference || null,
+        preapprovalId: preapprovalId || null,
+        payerEmail: paymentData.payer?.email || null,
+        rejectionReason: paymentData.status_detail
+      };
+      
+      await clinicRef.collection('transactions').doc(paymentId).set(transactionData);
+      
+      // Atualizar último pagamento rejeitado
+      await clinicRef.update({
+        lastRejectedPayment: transactionData,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      
+      console.log(`❌ Pagamento rejeitado ${paymentId} registrado para clínica ${clinicId}`);
+      console.log(`   - Motivo: ${paymentData.status_detail}`);
+      
+    } catch (error) {
+      console.error(`❌ Erro ao processar pagamento rejeitado ${paymentId}:`, error);
     }
   }
 

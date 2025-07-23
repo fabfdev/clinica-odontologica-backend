@@ -20,6 +20,9 @@ const transactionRoutes = require('./routes/transactions');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Trust proxy configuration - important for rate limiting and security
+app.set('trust proxy', 1); // Trust first proxy
+
 // Middleware setup
 app.use(helmet());
 app.use(compression());
@@ -30,7 +33,7 @@ app.use(cors({
   origin: [
     process.env.FRONTEND_URL || 'http://localhost:3000',
     'http://localhost:3000',
-    'https://your-domain.com' // Add your production domain here
+    'https://4095f23e6435.ngrok-free.app' // Add your production domain here
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -43,6 +46,16 @@ const limiter = rateLimit({
   max: 100, // limit each IP to 100 requests per windowMs
   message: {
     error: 'Too many requests from this IP, please try again later.'
+  },
+  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  // Skip rate limiting for localhost in development
+  skip: (req) => {
+    if (process.env.NODE_ENV === 'development') {
+      const ip = req.ip || req.connection.remoteAddress;
+      return ip === '::1' || ip === '127.0.0.1' || ip === '::ffff:127.0.0.1';
+    }
+    return false;
   }
 });
 app.use('/api/', limiter);
