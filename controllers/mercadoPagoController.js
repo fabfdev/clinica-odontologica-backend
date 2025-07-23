@@ -135,7 +135,7 @@ class MercadoPagoController {
         });
       }
 
-      // Cancelar assinatura no Mercado Pago
+      // Cancelar assinatura no Mercado Pago usando PUT
       const response = await preApproval.update({
         id: subscriptionId,
         body: {
@@ -143,17 +143,101 @@ class MercadoPagoController {
         }
       });
 
-      console.log('🗑️ Assinatura cancelada:', subscriptionId);
+      // Encontrar a clínica associada e atualizar status
+      const db = admin.firestore();
+      const clinicsQuery = await db.collection('clinics')
+        .where('mpSubscriptionId', '==', subscriptionId)
+        .get();
+      
+      if (!clinicsQuery.empty) {
+        const clinicDoc = clinicsQuery.docs[0];
+        const clinicData = clinicDoc.data();
+        
+        // Marcar como cancelada mas manter ativa até o fim do período
+        await clinicDoc.ref.update({
+          'subscription.status': 'cancelled',
+          'subscription.cancelledAt': admin.firestore.FieldValue.serverTimestamp(),
+          'subscription.willExpireAt': clinicData.subscription.expiresAt,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        
+        console.log('🗑️ Assinatura cancelada - mantendo acesso até:', clinicData.subscription.expiresAt);
+      }
 
       res.json({
         success: true,
-        message: 'Subscription cancelled successfully'
+        message: 'Subscription cancelled successfully. Access will remain until the end of the billing period.',
+        cancelledSubscriptionId: subscriptionId
       });
     } catch (error) {
       console.error('❌ Erro ao cancelar assinatura:', error);
+      
+      // Log detalhado do erro
+      if (error.response) {
+        console.error('MP API Response Error:', error.response.data);
+      }
+      
       res.status(500).json({ 
         error: 'Failed to cancel subscription',
-        details: error.message 
+        details: error.message,
+        mpError: error.response?.data || null
+      });
+    }
+  }
+
+  // Pausar assinatura
+  static async pauseSubscription(req, res) {
+    const { subscriptionId } = req.body;
+
+    try {
+      if (!subscriptionId) {
+        return res.status(400).json({ 
+          error: 'Missing required field: subscriptionId' 
+        });
+      }
+
+      // Pausar assinatura no Mercado Pago usando PUT
+      const response = await preApproval.update({
+        id: subscriptionId,
+        body: {
+          status: 'paused'
+        }
+      });
+
+      // Atualizar status no Firestore
+      const db = admin.firestore();
+      const clinicsQuery = await db.collection('clinics')
+        .where('mpSubscriptionId', '==', subscriptionId)
+        .get();
+      
+      if (!clinicsQuery.empty) {
+        const clinicDoc = clinicsQuery.docs[0];
+        
+        await clinicDoc.ref.update({
+          'subscription.status': 'paused',
+          'subscription.pausedAt': admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        
+        console.log('⏸️ Assinatura pausada:', subscriptionId);
+      }
+
+      res.json({
+        success: true,
+        message: 'Subscription paused successfully',
+        pausedSubscriptionId: subscriptionId
+      });
+    } catch (error) {
+      console.error('❌ Erro ao pausar assinatura:', error);
+      
+      if (error.response) {
+        console.error('MP API Response Error:', error.response.data);
+      }
+      
+      res.status(500).json({ 
+        error: 'Failed to pause subscription',
+        details: error.message,
+        mpError: error.response?.data || null
       });
     }
   }
