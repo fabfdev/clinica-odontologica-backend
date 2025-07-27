@@ -33,7 +33,7 @@ app.use(cors({
   origin: [
     process.env.FRONTEND_URL || 'http://localhost:3000',
     'http://localhost:3000',
-    'https://4095f23e6435.ngrok-free.app' // Add your production domain here
+    'https://d4990487d1be.ngrok-free.app' // Add your production domain here
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],

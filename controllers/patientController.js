@@ -1,4 +1,5 @@
 const firestoreService = require('../services/FirestoreService');
+const { isValidCPF, cleanCPF } = require('../utils/cpfValidator');
 
 // GET /api/patients/:clinicId
 async function getPatients(req, res) {
@@ -67,6 +68,35 @@ async function createPatient(req, res) {
       });
     }
     
+    // Validate CPF if provided
+    if (patientData.cpf) {
+      const cleanedCpf = cleanCPF(patientData.cpf);
+      
+      // Validate CPF format
+      if (!isValidCPF(cleanedCpf)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid CPF format'
+        });
+      }
+      
+      // Check if CPF already exists
+      const existingPatients = await firestoreService.getPatients(clinicId);
+      const duplicateCpf = existingPatients.find(patient => 
+        patient.cpf && cleanCPF(patient.cpf) === cleanedCpf
+      );
+      
+      if (duplicateCpf) {
+        return res.status(400).json({
+          success: false,
+          error: 'CPF already exists for another patient'
+        });
+      }
+      
+      // Store cleaned CPF
+      patientData.cpf = cleanedCpf;
+    }
+    
     const patientId = await firestoreService.createPatient(clinicId, patientData);
     
     res.status(201).json({
@@ -87,6 +117,14 @@ async function updatePatient(req, res) {
   try {
     const { clinicId, patientId } = req.params;
     const updateData = req.body;
+    
+    // Prevent CPF from being updated
+    if (updateData.cpf) {
+      return res.status(400).json({
+        success: false,
+        error: 'CPF cannot be modified after patient creation'
+      });
+    }
     
     await firestoreService.updatePatient(clinicId, patientId, updateData);
     
